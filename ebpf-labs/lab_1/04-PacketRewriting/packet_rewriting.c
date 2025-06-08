@@ -23,6 +23,11 @@
 #include "packet_rewriting.skel.h"
 
 /* TODO 3: Redefine the datarec structure in userspace*/
+struct datarec {
+    __u64 rx_packets;
+    __u64 rx_bytes;
+};
+
 
 static int ifindex_iface = 0;
 static __u32 xdp_flags = 0;
@@ -54,14 +59,29 @@ void sigint_handler(int sig_no) {
 
 void poll_stats(struct packet_rewriting_bpf *skel) {
     /* TODO 1: get the map file descriptor for the skeleton */
+    int map_fd = bpf_map__fd(skel->maps.xdp_stats_map);
+    if (map_fd < 0) {
+        log_fatal("Error while getting map file descriptor");
+        exit(1);
+    }
 
     while(true) {
         /* TODO 2: define the value type (struct datarec) */
-        
+        struct datarec value;
+        int err;
+        int key = 0;
+
         /* TODO 4: get the value of the map for the key 0 */
-        
+        err = bpf_map_lookup_elem(map_fd, &key, &value);
+        if (err != 0) {
+            log_error("Failed to lookup data record in map");
+            return;
+        }
+
         /* TODO 5: print the number of packets received */
+        log_info("Packets received: %llu", value.rx_packets);
         /* TODO 6: print the number of bytes received */
+        log_info("Bytes received: %llu", value.rx_bytes);
         sleep(1);
     }
 }

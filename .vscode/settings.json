@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "ip.h": "c",
+        "packet_parsing.skel.h": "c"
+    }
+}
