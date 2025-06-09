@@ -97,22 +97,6 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             }
 
         TCP_FORWARD:;
-            if (value->state == SYN_SENT) {
-                if ((pkt.flags & TCPHDR_SYN) != 0 && (pkt.flags | TCPHDR_SYN) == TCPHDR_SYN) {
-                    value->ttl = timestamp + TCP_SYN_SENT;
-                    bpf_spin_unlock(&value->lock);
-                    pkt.connStatus = SYN_SENT;
-                    goto PASS_ACTION;
-                } else {
-                    pkt.connStatus = INVALID;
-                    bpf_spin_unlock(&value->lock);
-                    bpf_log_debug("[FW_DIRECTION] Failed ACK "
-                                  "check in "
-                                  "SYN_SENT state. Flags: %x\n",
-                                  pkt.flags);
-                    goto PASS_ACTION;
-                }
-            }
 
             if (value->state == SYN_RECV) {
                 if ((pkt.flags & TCPHDR_ACK) != 0 && (pkt.flags | TCPHDR_ACK) == TCPHDR_ACK &&
@@ -184,33 +168,6 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
                 }
             }
 
-            if (value->state == FIN_WAIT_2) {
-                if ((pkt.flags & TCPHDR_ACK) && pkt.ackN == value->sequence) { // Here I'm waiting for the last ACK
-                    value->state = LAST_ACK;
-                    value->ttl = timestamp + TCP_LAST_ACK;
-                    value->sequence = pkt.ackN;
-
-                    bpf_spin_unlock(&value->lock);
-                    bpf_log_debug("[FW_DIRECTION] Changing "
-                                  "state from "
-                                  "FIN_WAIT_2 to LAST_ACK\n");
-                    pkt.connStatus = FIN_WAIT_2;
-
-                    goto PASS_ACTION;
-                } else {
-                    // Still receiving packets
-                    value->ttl = timestamp + TCP_FIN_WAIT;
-                    bpf_spin_unlock(&value->lock);
-                    bpf_log_debug("[FW_DIRECTION] Failed FIN "
-                                  "check in "
-                                  "FIN_WAIT_2 state. Flags: %x. Seq: %u\n",
-                                  pkt.flags, value->sequence);
-                    pkt.connStatus = FIN_WAIT_2;
-
-                    goto PASS_ACTION;
-                }
-            }
-
             if (value->state == LAST_ACK) {
                 if ((pkt.flags & TCPHDR_ACK) == TCPHDR_ACK && pkt.seqN == value->sequence) {
                     value->state = TIME_WAIT;
@@ -259,18 +216,6 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
                                   "SYN_SENT to SYN_RECV\n");
                     pkt.connStatus = SYN_SENT; // When the state changes to SYN_RECV, we set the connStatus to SYN_SENT
 
-                    goto PASS_ACTION;
-                }
-                pkt.connStatus = INVALID;
-                bpf_spin_unlock(&value->lock);
-                goto PASS_ACTION;
-            }
-
-            if (value->state == SYN_RECV) {
-                if ((pkt.flags & TCPHDR_ACK) != 0 && (pkt.flags & TCPHDR_SYN) != 0) {
-                    value->ttl = timestamp + TCP_SYN_RECV;
-                    bpf_spin_unlock(&value->lock);
-                    pkt.connStatus = SYN_RECV;
                     goto PASS_ACTION;
                 }
                 pkt.connStatus = INVALID;
@@ -391,6 +336,10 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             newEntry.portRev = portRev;
 
             bpf_map_update_elem(&connections, &key, &newEntry, BPF_ANY);
+
+            pkt.connStatus = SYN_SENT; // Set the connStatus to SYN_SENT
+            bpf_log_debug("TCP_MISS: New connection created. State: SYN_SENT. Seq: %u\n",
+                          newEntry.sequence);
             goto PASS_ACTION;
         } else {
             // Validation failed
