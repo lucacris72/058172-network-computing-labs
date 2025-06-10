@@ -80,24 +80,31 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
     uint64_t timestamp;
     timestamp = bpf_ktime_get_ns();
 
-    /* == UDP == */
+/* == UDP == */
     if (pkt.l4proto == IPPROTO_UDP) {
         struct ct_v *value = bpf_map_lookup_elem(&connections, &key);
         if (value) {
-            // flow già esistente → ESTABLISHED
+            if (ipRev == value->ipRev && portRev == value->portRev) {
+                bpf_log_debug("[FW_DIRERCTION]");
+            } else {
+                bpf_log_debug("[REV_DIRECTION]");
+            }
             bpf_spin_lock(&value->lock);
             value->state = ESTABLISHED;
             value->ttl   = timestamp + UDP_ESTABLISHED_TIMEOUT; // ns
             bpf_spin_unlock(&value->lock);
+            bpf_log_debug("UDP flow already exists, updating state to ESTABLISHED. TTL = %llu\n", value->ttl);
             pkt.connStatus = ESTABLISHED;
         } else {
             // primo pacchetto → NEW
+            // Questo definisce la direzione "Forward" per la vita della connessione
             struct ct_v newEntry = {};
             newEntry.state   = NEW;
-            newEntry.ttl     = timestamp + UDP_NEW_TIMEOUT;     // ns
-            newEntry.ipRev   = ipRev;
-            newEntry.portRev = portRev;
+            newEntry.ttl     = timestamp + UDP_NEW_TIMEOUT;      // ns
+            newEntry.ipRev   = ipRev;   // Salva la direzione del primo pacchetto
+            newEntry.portRev = portRev; // Salva la direzione del primo pacchetto
             bpf_map_update_elem(&connections, &key, &newEntry, BPF_ANY);
+            bpf_log_debug("[FW_DIRERCTION] UDP flow not found, creating new entry. TTL = %llu\n", newEntry.ttl);
             pkt.connStatus = NEW;
         }
         goto PASS_ACTION;
