@@ -38,8 +38,9 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
         bpf_log_debug("Failed to parse packet\n");
         return XDP_DROP;
     }
-
-    bpf_log_debug("Packet parsed, now starting the conntrack. The packet has flags: %x And SRC,DST PORT: %u,%u\n", pkt.flags, bpf_ntohs(pkt.srcPort), bpf_ntohs(pkt.dstPort));
+    uint32_t seq = bpf_ntohl(pkt.seqN);
+    uint32_t ack = bpf_ntohl(pkt.ackN);
+    bpf_log_debug("Packet parsed, now starting the conntrack. The packet has flags: %x And SRC,DST PORT: %u,%u And seq,ack: %u,%u", pkt.flags, bpf_ntohs(pkt.srcPort), bpf_ntohs(pkt.dstPort), seq, ack);
 
     struct ct_k key;
     __builtin_memset(&key, 0, sizeof(key));
@@ -79,14 +80,53 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
     uint64_t timestamp;
     timestamp = bpf_ktime_get_ns();
 
+    /* == UDP == */
+    if (pkt.l4proto == IPPROTO_UDP) {
+        struct ct_v *value = bpf_map_lookup_elem(&connections, &key);
+        if (value) {
+            // flow già esistente → ESTABLISHED
+            bpf_spin_lock(&value->lock);
+            value->state = ESTABLISHED;
+            value->ttl   = timestamp + UDP_ESTABLISHED_TIMEOUT; // ns
+            bpf_spin_unlock(&value->lock);
+            pkt.connStatus = ESTABLISHED;
+        } else {
+            // primo pacchetto → NEW
+            struct ct_v newEntry = {};
+            newEntry.state   = NEW;
+            newEntry.ttl     = timestamp + UDP_NEW_TIMEOUT;     // ns
+            newEntry.ipRev   = ipRev;
+            newEntry.portRev = portRev;
+            bpf_map_update_elem(&connections, &key, &newEntry, BPF_ANY);
+            pkt.connStatus = NEW;
+        }
+        goto PASS_ACTION;
+    }
+
     /* == TCP  == */
     if (pkt.l4proto == IPPROTO_TCP) {
         if ((pkt.flags & TCPHDR_RST) != 0) {
+            value = bpf_map_lookup_elem(&connections, &key);
+            if (value != NULL) {
+                bpf_map_delete_elem(&connections, &key);
+                bpf_log_debug("RST received on a existing connection, deleting connection entry.\n");
+            } else {
+                bpf_log_debug("RST received on a non-existing connection, nothing to delete.\n");
+            }
+            bpf_log_debug("RESETTING CONNECTION.\n");
+            pkt.connStatus = RST; // Set the connStatus to RST
             goto PASS_ACTION;
         }
         value = bpf_map_lookup_elem(&connections, &key);
         if (value != NULL) {    // When a new packet arrives, value is NULL and we go to TCP_MISS
             bpf_spin_lock(&value->lock);    // We need to lock the value to prevent data races
+            if (value->ttl < timestamp) {
+                // If the entry has expired, we remove it
+                bpf_spin_unlock(&value->lock);
+                bpf_map_delete_elem(&connections, &key);
+                bpf_log_debug("Connection expired. Removing entry.\n");
+                goto TCP_MISS;
+            }
             if ((value->ipRev == ipRev) && (value->portRev == portRev)) {
                 goto TCP_FORWARD;
             } else if ((value->ipRev != ipRev) && (value->portRev != portRev)) {
@@ -100,7 +140,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
 
             if (value->state == SYN_RECV) {
                 if ((pkt.flags & TCPHDR_ACK) != 0 && (pkt.flags | TCPHDR_ACK) == TCPHDR_ACK &&
-                    (pkt.ackN == value->sequence)) {
+                    (pkt.ackN == value->sequence + HEX_BE_ONE)) {
                     value->state = ESTABLISHED;
                     value->ttl = timestamp + TCP_ESTABLISHED;
 
@@ -123,14 +163,11 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             }
 
             if (value->state == ESTABLISHED) {
-                bpf_spin_unlock(&value->lock);
-                bpf_log_debug("Connnection is ESTABLISHED\n");
-                bpf_spin_lock(&value->lock);
                 if ((pkt.flags & TCPHDR_FIN) != 0) {
                     // Initiating closing sequence
                     value->state = FIN_WAIT_1;
                     value->ttl = timestamp + TCP_FIN_WAIT;
-                    value->sequence = pkt.ackN;
+                    value->sequence = pkt.seqN;
 
                     bpf_spin_unlock(&value->lock);
                     bpf_log_debug("[FW_DIRECTION] Changing "
@@ -144,6 +181,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
                 } else {
                     value->ttl = timestamp + TCP_ESTABLISHED;
                     bpf_spin_unlock(&value->lock);
+                    bpf_log_debug("Connnection is ESTABLISHED\n");
                     pkt.connStatus = ESTABLISHED;
                     goto PASS_ACTION;
                 }
@@ -155,25 +193,26 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
                 bool fin_ack  = (pkt.flags & (TCPHDR_ACK | TCPHDR_FIN))
                                 == (TCPHDR_ACK  | TCPHDR_FIN);
 
-                if (ack_only) {
+                if (ack_only && pkt.ackN == value->sequence + HEX_BE_ONE) {
                     /* primo ACK: passo a CLOSE_WAIT */
                     value->state    = CLOSE_WAIT;
                     value->ttl      = timestamp + TCP_CLOSE_WAIT;
-                    value->sequence = pkt.ackN;
+                    value->sequence = pkt.seqN;
                     bpf_spin_unlock(&value->lock);
-                    bpf_log_debug("[FW_DIRECTION] Changing state from ESTABLISHED to CLOSE_WAIT\n"
-                                "[REV_DIRECTION] Changing state (on ACK received) from "
+                    bpf_log_debug("[FW_DIRECTION] Changing state from ESTABLISHED to CLOSE_WAIT\n");
+                    bpf_log_debug("[REV_DIRECTION] Changing state (on ACK received) from "
                                   "FIN_WAIT_1 to FIN_WAIT_2\n");
                     pkt.connStatus = CLOSE_WAIT;
                     goto PASS_ACTION;
 
-                } else if (fin_ack) {
+                } else if (fin_ack && pkt.ackN == value->sequence + HEX_BE_ONE) {
                     /* pacchetto unico FIN+ACK: salto direttamente a LAST_ACK */
                     value->state = LAST_ACK;
                     value->ttl   = timestamp + TCP_LAST_ACK; /* o TCP_TIME_WAIT se lo hai definito */
+                    value->sequence = pkt.seqN;
                     bpf_spin_unlock(&value->lock);
-                    bpf_log_debug("[FW_DIRECTION] ESTABLISHED to LAST_ACK (piggyback)\n"
-                                    "[REV_DIRECTION] Will skip FIN_WAIT_2");
+                    bpf_log_debug("[FW_DIRECTION] Changing state from ESTABLISHED to LAST_ACK (piggyback)\n");
+                    bpf_log_debug("[REV_DIRECTION] Will skip FIN_WAIT_2\n");
                     pkt.connStatus = LAST_ACK;
                     goto PASS_ACTION;
 
@@ -181,17 +220,17 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
                     /* flag inattese: invalid */
                     value->ttl      = timestamp + TCP_FIN_WAIT;
                     bpf_spin_unlock(&value->lock);
-                    bpf_log_debug("[FW_DIRECTION] FIN_WAIT_1: flag inaspettate %x\n",
+                    bpf_log_debug("[FW_DIRECTION] FIN_WAIT_1: invalid flag %x\n",
                                 pkt.flags);
                     pkt.connStatus = INVALID;
                     goto PASS_ACTION;
                 }
             }
             if (value->state == CLOSE_WAIT) {
-                if ((pkt.flags & TCPHDR_FIN) != 0) {
+                if ((pkt.flags & TCPHDR_FIN) != 0 && pkt.seqN == value->sequence) {
                     value->state = LAST_ACK;
                     value->ttl = timestamp + TCP_LAST_ACK;
-                    value->sequence = pkt.ackN;
+                    value->sequence = pkt.seqN;
                     bpf_spin_unlock(&value->lock);
                     bpf_log_debug("[FW_DIRECTION] Changing "
                                   "state from "
@@ -208,10 +247,10 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             }
 
             if (value->state == FIN_WAIT_2) {
-                if ((pkt.flags & TCPHDR_ACK) != 0 ) { // Check the sequence number, not the ack number && pkt.seqN == value->sequence
+                if ((pkt.flags & TCPHDR_ACK) != 0 && pkt.seqN == value->sequence) { // Check the sequence number, not the ack number && pkt.seqN == value->sequence
                     value->state = LAST_ACK;
                     value->ttl = timestamp + TCP_LAST_ACK;
-                    value->sequence = pkt.ackN;
+                    value->sequence = pkt.seqN;
                     bpf_spin_unlock(&value->lock);
                     bpf_log_debug("[FW_DIRECTION] Changing "
                                   "state from "
@@ -233,7 +272,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             }
 
             if (value->state == LAST_ACK) {
-                if ((pkt.flags & TCPHDR_ACK) != 0) {
+                if ((pkt.flags & TCPHDR_ACK) != 0 && pkt.ackN == value->sequence + HEX_BE_ONE) { // Check if the packet is an ACK packet and the ack number matches the sequence number
                     value->state = TIME_WAIT;
                     value->ttl = timestamp + TCP_LAST_ACK;
 
@@ -273,7 +312,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
                     pkt.ackN == value->sequence + HEX_BE_ONE) { // Check if the packet is a SYN-ACK packet NB the ack number is incremented by 1 (BIG-ENDIAN)
                     value->state = SYN_RECV;
                     value->ttl = timestamp + TCP_SYN_RECV;
-                    value->sequence = pkt.seqN + HEX_BE_ONE; // Increment sequence number by 1 for SYN-ACK (BIG-ENDIAN) because in the response we send SYN-ACK
+                    value->sequence = pkt.seqN; // Increment sequence number by 1 for SYN-ACK (BIG-ENDIAN) because in the response we send SYN-ACK
                     bpf_spin_unlock(&value->lock);
                     bpf_log_debug("[REV_DIRECTION] Changing "
                                   "state from "
@@ -288,14 +327,11 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             }
 
             if (value->state == ESTABLISHED) {
-                bpf_spin_unlock(&value->lock);
-                bpf_log_debug("Connnection is ESTABLISHED\n");
-                bpf_spin_lock(&value->lock);
                 if ((pkt.flags & TCPHDR_FIN) != 0) {
                     // Initiating closing sequence
                     value->state = FIN_WAIT_1;
                     value->ttl = timestamp + TCP_FIN_WAIT;
-                    value->sequence = pkt.ackN;
+                    value->sequence = pkt.seqN;
                     bpf_spin_unlock(&value->lock);
                     bpf_log_debug("[REV_DIRECTION] Changing "
                                   "state from "
@@ -307,6 +343,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
                 } else {
                     value->ttl = timestamp + TCP_ESTABLISHED;
                     bpf_spin_unlock(&value->lock);
+                    bpf_log_debug("Connnection is ESTABLISHED\n");
                     pkt.connStatus = ESTABLISHED;
                     goto PASS_ACTION;
                 }
@@ -318,25 +355,26 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
                 bool fin_ack  = (pkt.flags & (TCPHDR_ACK | TCPHDR_FIN))
                                 == (TCPHDR_ACK  | TCPHDR_FIN);
 
-                if (ack_only) {
+                if (ack_only && pkt.ackN == value->sequence + HEX_BE_ONE) {
                     /* primo ACK: passo a CLOSE_WAIT */
                     value->state    = CLOSE_WAIT;
                     value->ttl      = timestamp + TCP_CLOSE_WAIT;
-                    value->sequence = pkt.ackN;
+                    value->sequence = pkt.seqN;
                     bpf_spin_unlock(&value->lock);
-                    bpf_log_debug("[REV_DIRECTION] Changing state form ESTABLISHED to CLOSE_WAIT\n"
-                                  "[FW_DIRECTION] Changing state (on ACK received) from "
+                    bpf_log_debug("[REV_DIRECTION] Changing state form ESTABLISHED to CLOSE_WAIT\n");
+                    bpf_log_debug("[FW_DIRECTION] Changing state (on ACK received) from "
                                   "FIN_WAIT_1 to FIN_WAIT_2\n");
                     pkt.connStatus = CLOSE_WAIT;
                     goto PASS_ACTION;
 
-                } else if (fin_ack) {
+                } else if (fin_ack && pkt.ackN == value->sequence + HEX_BE_ONE) {
                     /* pacchetto unico FIN+ACK: salto direttamente a LAST_ACK */
                     value->state = LAST_ACK;
                     value->ttl   = timestamp + TCP_LAST_ACK; /* o TCP_TIME_WAIT se lo hai definito */
+                    value->sequence = pkt.seqN;
                     bpf_spin_unlock(&value->lock);
-                    bpf_log_debug("[REV_DIRECTION] ESTABLISHED to LAST_ACK (piggyback)\n"
-                                  "[FW_DIRECTION] Will skip FIN_WAIT_2\n");
+                    bpf_log_debug("[REV_DIRECTION] Changing state from ESTABLISHED to LAST_ACK (piggyback)\n");
+                    bpf_log_debug("[FW_DIRECTION] Will skip FIN_WAIT_2\n");
                     pkt.connStatus = LAST_ACK;
                     goto PASS_ACTION;
 
@@ -344,7 +382,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
                     /* flag inattese: invalid */
                     value->ttl      = timestamp + TCP_FIN_WAIT;
                     bpf_spin_unlock(&value->lock);
-                    bpf_log_debug("[REV_DIRECTION] FIN_WAIT_1: flag inaspettate %x\n",
+                    bpf_log_debug("[REV_DIRECTION] FIN_WAIT_1: invalid flag %x\n",
                                 pkt.flags);
                     pkt.connStatus = INVALID;
                     goto PASS_ACTION;
@@ -352,10 +390,10 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             }
 
             if (value->state == CLOSE_WAIT) {
-                if ((pkt.flags & TCPHDR_FIN) != 0) {
+                if ((pkt.flags & TCPHDR_FIN) != 0 && pkt.seqN == value->sequence) {
                     value->state = LAST_ACK;
                     value->ttl = timestamp + TCP_LAST_ACK;
-                    value->sequence = pkt.ackN;
+                    value->sequence = pkt.seqN;
                     bpf_spin_unlock(&value->lock);
                     bpf_log_debug("[REV_DIRECTION] Changing "
                                   "state from "
@@ -372,10 +410,10 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             }
 
             if (value->state == FIN_WAIT_2) {
-                if ((pkt.flags & TCPHDR_ACK) != 0) {
+                if ((pkt.flags & TCPHDR_ACK) != 0 && pkt.seqN == value->sequence) { // Check the sequence number, not the ack number && pkt.seqN == value->sequence
                     value->state = LAST_ACK;
                     value->ttl = timestamp + TCP_LAST_ACK;
-                    value->sequence = pkt.ackN;
+                    value->sequence = pkt.seqN;
                     bpf_spin_unlock(&value->lock);
                     bpf_log_debug("[REV_DIRECTION] Changing "
                                   "state from "
@@ -397,7 +435,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             }
 
             if (value->state == LAST_ACK) {
-                if ((pkt.flags & TCPHDR_ACK) != 0) { // Check if the packet is an ACK packet and the ack number matches the sequence number
+                if ((pkt.flags & TCPHDR_ACK) != 0 && pkt.ackN == value->sequence + HEX_BE_ONE) { // Check if the packet is an ACK packet and the ack number matches the sequence number
                     value->state = TIME_WAIT;
                     value->ttl = timestamp + TCP_LAST_ACK;
                     bpf_spin_unlock(&value->lock);
@@ -439,7 +477,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
         if ((pkt.flags & TCPHDR_SYN) != 0) { // Check if the packet is a SYN packet, in that case we create a new entry
             newEntry.state = SYN_SENT;
             newEntry.ttl = timestamp + TCP_SYN_SENT; // Set the TTL for the SYN_SENT state
-            newEntry.sequence = pkt.seqN; // Set the sequence number for the SYN packet
+            newEntry.sequence = pkt.seqN; // Set the sequence number for the SYN packet, in this case only the seqN is used
 
             newEntry.ipRev = ipRev;
             newEntry.portRev = portRev;
@@ -448,11 +486,12 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
 
             pkt.connStatus = SYN_SENT; // Set the connStatus to SYN_SENT
             bpf_log_debug("TCP_MISS: New connection created. State: SYN_SENT. Seq: %u\n",
-                          newEntry.sequence);
+                          bpf_ntohl(newEntry.sequence));
             goto PASS_ACTION;
         } else {
             // Validation failed
-            bpf_log_debug("Validation failed %d\n", pkt.flags);
+            bpf_log_debug("Validation failed. Non-SYN packet for expired/missing connection with flag:%d\n", pkt.flags);
+            pkt.connStatus = INVALID; // Set the connStatus to INVALID
             goto PASS_ACTION;
         }
     }
