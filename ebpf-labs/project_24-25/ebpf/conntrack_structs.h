@@ -16,6 +16,7 @@ typedef enum {
     FIN_WAIT_2,
     CLOSE_WAIT,
     LAST_ACK,
+    CLOSING,
     TIME_WAIT,
     RST,
 } conntrack_states_t;
